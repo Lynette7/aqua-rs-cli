@@ -16,15 +16,17 @@ use clap::{Arg, ArgAction, ArgGroup, Command};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::{env, path::PathBuf};
 use utils::{is_valid_file, is_valid_json_file, is_valid_output_file};
-use aqua_verifier::aqua_verifier::{AquaVerifier, VerificationOptions};
+// use aqua_verifier::aqua_verifier::{AquaVerifier, VerificationOptions};
 
 const LONG_ABOUT: &str = r#"🔐 Aqua CLI TOOL
 
 ========================================================
 
-This tool validates files using a aqua protocol. It can:
-  • Verify aqua chain json file
-  • Generate aqua chain.
+This tool validates files using the Aqua Protocol v3.2. It can:
+  • Verify Aqua tree JSON files
+  • Generate Aqua trees
+  • Sign Aqua trees
+  • Witness Aqua trees
   • Generate validation reports
 
 COMMANDS: 
@@ -54,7 +56,7 @@ EXAMPLES:
 
 
 SUMMARY
-   * aquq-cli expects ateast parameter -s,-v,-w or -f.
+   * aqua-cli expects at least parameter -s,-a,-w or -f.
    * in your environment set the
     1. aqua_domain="random_alphanumeric"
     2. aqua_network="sepolia" or  "holesky" or "mainnet"
@@ -65,11 +67,11 @@ For more information, visit: https://github.com/inblockio/aqua-verifier-cli"#;
 
 pub fn parse_args() -> Result<CliArgs, String> {
     let matches = Command::new("aqua-cli")
-    .version(env!("CARGO_PKG_VERSION"))
+        .version("3.2.0")
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .long_about(LONG_ABOUT)
-        .about("🔐 Aqua CLI Tool - Validates, Verifies, Signs , Witness aqua chain file and genreates aqua chain files  using aqua protocol")
+        .about("🔐 Aqua CLI Tool v3.2 - Validates, Verifies, Signs, Witness Aqua tree files and generates Aqua tree files using Aqua Protocol v3.2")
         .arg(Arg::new("authenticate")
             .short('a')
             .long("authenticate")
@@ -208,18 +210,10 @@ fn main() {
     let api_key = env::var("api_key").unwrap_or("".to_string());
     let keys_file_env = env::var("keys_file").unwrap_or("".to_string());
 
-    println!("verification_platform  {} and api key {}  ", verification_platform, api_key);
-
-    let option = VerificationOptions {
-        version: 1.2,
-        strict: false,
-        allow_null: false,
-        verification_platform: verification_platform,
-        chain: chain,
-        api_key: api_key,
-    };
-
-    let aqua_verifier = AquaVerifier::new(Some(option));
+    println!("🔐 Aqua CLI v3.2 - verification_platform: {} | api_key: [{}]", 
+        verification_platform, 
+        if api_key.is_empty() { "not set" } else { "set" }
+    );
 
     let args = parse_args().unwrap_or_else(|err| {
         eprintln!("Error: {}", err);
@@ -229,7 +223,7 @@ fn main() {
     // validation of combined flags
     if args.authenticate.is_some() || args.sign.is_some() || args.witness.is_some() {
         if args.file.is_some() {
-            eprintln!("Error: -f/--file cannot be used with -v, -s, or -w");
+            eprintln!("Error: -f/--file cannot be used with -a, -s, or -w");
             std::process::exit(1);
         }
     }
@@ -258,18 +252,17 @@ fn main() {
         args.clone().file.is_some(),
         args.clone().remove.is_some(),
     ) {
-        (Some(verify_path), _, _, _, _) => cli_verify_chain(args, aqua_verifier, verify_path),
-        (_, Some(sign_path), _, _, _) => cli_sign_chain(args, aqua_verifier, sign_path, keys_file),
+        (Some(verify_path), _, _, _, _) => cli_verify_chain(args, verify_path),
+        (_, Some(sign_path), _, _, _) => cli_sign_chain(args, sign_path, keys_file),
         (_, _, Some(witness_path), _, _) => {
-            cli_winess_chain(args.clone(), aqua_verifier, witness_path)
+            cli_winess_chain(args.clone(), witness_path)
         }
-        (_, _, _, true, _) => cli_generate_aqua_chain(args.clone(), aqua_verifier, aqua_domain),
+        (_, _, _, true, _) => cli_generate_aqua_chain(args.clone(), aqua_domain),
         (_, _, _, _, true) => cli_remove_revisions_from_aqua_chain(
             args.clone(),
-            aqua_verifier,
             args.clone()
                 .remove
-                .expect("aqua chain file to delete revision"),
+                .expect("aqua tree file to delete revision"),
         ),
         _ => unreachable!(
             "Unable to determin course of action **Clap ensures at least one operation is selected"
