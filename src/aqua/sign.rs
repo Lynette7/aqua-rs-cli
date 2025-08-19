@@ -1,12 +1,16 @@
 use crate::aqua::wallet::{create_ethereum_signature, get_wallet};
-use crate::models::CliArgs;
+use crate::models::{
+    CliArgs, AquaTree, Revision, SignatureRevision, BaseRevision, SignPayload,
+    HashingMethod, create_version_string, generate_timestamp, DEFAULT_SIGNATURE_TYPE
+};
 use crate::servers::server_sign::sign_message_server;
-use crate::utils::{read_aqua_data, read_secreat_keys, save_logs_to_file, save_page_data};
-use aqua_verifier_rs_types::models::content::RevisionContentSignature;
-use aqua_verifier_rs_types::models::page_data::PageData;
+use crate::utils::{
+    read_aqua_data, read_secret_keys, save_logs_to_file, save_aqua_tree,
+    get_latest_revision, calculate_revision_hash, build_tree_mapping
+};
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
-use aqua_verifier::aqua_verifier::AquaVerifier;
 
 /// Represents the result of extracting chain data
 struct ChainExtractionResult {
@@ -21,16 +25,14 @@ struct SigningResult {
     wallet_address: String,
 }
 
-/// Main function to handle the CLI signing chain process
+/// Main function to handle the CLI signing process
 ///
 /// # Arguments
 /// * `args` - CLI arguments
-/// * `aqua_verifier` - Instance of AquaVerifier
 /// * `sign_path` - Path to the file to be signed
 /// * `keys_file` - Optional path to the keys file
-pub(crate) fn cli_sign_chain(
+pub fn cli_sign_chain(
     args: CliArgs,
-    aqua_verifier: AquaVerifier,
     sign_path: PathBuf,
     keys_file: Option<PathBuf>,
 ) {
@@ -40,7 +42,7 @@ pub(crate) fn cli_sign_chain(
         sign_path
     ));
 
-    match process_signing_chain(&args, aqua_verifier, &sign_path, keys_file, &mut logs_data) {
+    match process_signing_chain(&args, &sign_path, keys_file, &mut logs_data) {
         Ok(_) => {
             logs_data.push("Signing process completed successfully".to_string());
         }
@@ -55,23 +57,49 @@ pub(crate) fn cli_sign_chain(
 /// Process the signing chain operation
 fn process_signing_chain(
     args: &CliArgs,
-    aqua_verifier: AquaVerifier,
     sign_path: &PathBuf,
     keys_file: Option<PathBuf>,
     logs_data: &mut Vec<String>,
 ) -> Result<(), String> {
-    let aqua_page_data = read_and_validate_data(sign_path, logs_data)?;
-    let chain_data = extract_chain_data(&aqua_page_data, logs_data)?;
+    let mut aqua_tree = read_and_validate_data(sign_path, logs_data)?;
+    let chain_data = extract_chain_data(&aqua_tree, logs_data)?;
     let sign_result = perform_signing(&chain_data.last_revision_hash, keys_file, logs_data, args)?;
 
-    let rev_sig = RevisionContentSignature {
+    // Create signature revision
+    let signature_revision = SignatureRevision {
+        base: BaseRevision {
+            previous_verification_hash: chain_data.last_revision_hash,
+            local_timestamp: generate_timestamp(),
+            version: create_version_string(HashingMethod::Scalar),
+        },
         signature: sign_result.signature,
-        wallet_address: sign_result.wallet_address,
-        publickey: sign_result.public_key,
-        filename: chain_data.genesis_revision_filename,
+        signature_public_key: sign_result.public_key,
+        signature_wallet_address: sign_result.wallet_address,
+        signature_type: DEFAULT_SIGNATURE_TYPE.to_string(),
     };
 
-    process_verification_and_save(aqua_verifier, aqua_page_data, rev_sig, sign_path, logs_data)?;
+    let signature_revision_enum = Revision::Signature(signature_revision);
+    
+    // Calculate hash for the new signature revision
+    let signature_hash = calculate_revision_hash(&signature_revision_enum, HashingMethod::Scalar)
+        .map_err(|e| format!("Error calculating signature revision hash: {}", e))?;
+
+    // Add signature revision to the tree
+    aqua_tree.revisions.insert(signature_hash.clone(), signature_revision_enum);
+
+    // Update file index if present
+    if let Some(ref mut file_index) = aqua_tree.file_index {
+        file_index.insert(signature_hash.clone(), chain_data.genesis_revision_filename);
+    }
+
+    // Rebuild tree mapping
+    aqua_tree.tree_mapping = Some(build_tree_mapping(&aqua_tree.revisions));
+
+    // Save the updated Aqua tree
+    save_aqua_tree(&aqua_tree, sign_path, "signed.json".to_string())
+        .map_err(|e| format!("Error saving signed Aqua tree: {}", e))?;
+
+    logs_data.push("Signature revision added successfully".to_string());
     Ok(())
 }
 
@@ -79,7 +107,7 @@ fn process_signing_chain(
 fn read_and_validate_data(
     sign_path: &PathBuf,
     logs_data: &mut Vec<String>,
-) -> Result<PageData, String> {
+) -> Result<AquaTree, String> {
     logs_data.push("Info : Reading and validating input data...".to_string());
     read_aqua_data(sign_path).map_err(|e| {
         logs_data.push(format!("Error : Error reading aqua data: {}", e));
@@ -87,46 +115,45 @@ fn read_and_validate_data(
     })
 }
 
-/// Extract necessary chain data from the page data
+/// Extract necessary chain data from the Aqua tree
 fn extract_chain_data(
-    aqua_page_data: &PageData,
+    aqua_tree: &AquaTree,
     logs_data: &mut Vec<String>,
 ) -> Result<ChainExtractionResult, String> {
     logs_data.push("Info : Extracting chain data...".to_string());
 
-    let aqua_chain = aqua_page_data.pages.get(0).ok_or_else(|| {
-        let error = "Error : No aqua chain found in page data".to_string();
-        logs_data.push(error.clone());
-        error
-    })?;
+    // Get the latest revision
+    let (latest_hash, latest_revision) = get_latest_revision(aqua_tree)
+        .ok_or_else(|| {
+            let error = "Error : No revisions found in Aqua tree".to_string();
+            logs_data.push(error.clone());
+            error
+        })?;
 
-    let genesis_hash_revision = aqua_chain.revisions.get(0).ok_or_else(|| {
-        let error = "Error : Error fetching genesis revision".to_string();
-        logs_data.push(error.clone());
-        error
-    })?;
+    // Find genesis revision (the one with empty previous_verification_hash)
+    let mut genesis_filename = "unknown".to_string();
+    for (hash, revision) in &aqua_tree.revisions {
+        let previous_hash = match revision {
+            Revision::File(r) => &r.base.previous_verification_hash,
+            Revision::Form(r) => &r.base.previous_verification_hash,
+            Revision::Signature(r) => &r.base.previous_verification_hash,
+            Revision::Witness(r) => &r.base.previous_verification_hash,
+            Revision::Link(r) => &r.base.previous_verification_hash,
+        };
 
-    let (_genesis_hash, genesis_revision) = genesis_hash_revision;
-
-    let genesis_filename = genesis_revision
-        .content
-        .clone()
-        .file
-        .ok_or_else(|| "Error : No filename found in genesis revision".to_string())?
-        .filename;
-
-    let last_revision_hash = if aqua_chain.revisions.len() == 1 {
-        genesis_revision.metadata.verification_hash.to_string()
-    } else {
-        let (_last_hash, last_rev) = aqua_chain
-            .revisions
-            .get(aqua_chain.revisions.len() - 1)
-            .ok_or_else(|| "Error : error getting last revision".to_string())?;
-        last_rev.metadata.verification_hash.to_string()
-    };
+        if previous_hash.is_empty() {
+            // This is the genesis revision, try to get filename from file_index
+            if let Some(file_index) = &aqua_tree.file_index {
+                if let Some(filename) = file_index.get(hash) {
+                    genesis_filename = filename.clone();
+                }
+            }
+            break;
+        }
+    }
 
     Ok(ChainExtractionResult {
-        last_revision_hash,
+        last_revision_hash: latest_hash,
         genesis_revision_filename: genesis_filename,
     })
 }
@@ -156,7 +183,7 @@ fn perform_local_signing(
 ) -> Result<SigningResult, String> {
     logs_data.push("Info : Performing local signing...".to_string());
 
-    let secret_keys = read_secreat_keys(&keys_path).map_err(|e| {
+    let secret_keys = read_secret_keys(&keys_path).map_err(|e| {
         let error = format!("Error :  error reading secret keys: {}", e);
         logs_data.push(error.clone());
         error
@@ -170,7 +197,7 @@ fn perform_local_signing(
 
     let gen_wallet_on_fail = if args.level.is_none() {
         true
-    } else if args.level.as_ref().unwrap().trim() == "1".to_string() {
+    } else if args.level.as_ref().unwrap().trim() == "1" {
         false
     } else {
         true
@@ -224,39 +251,6 @@ fn perform_server_signing(
         public_key: sign_payload.public_key,
         wallet_address: sign_payload.wallet_address,
     })
-}
-
-/// Process verification and save the results
-fn process_verification_and_save(
-    aqua_verifier: AquaVerifier,
-    aqua_page_data: PageData,
-    rev_sig: RevisionContentSignature,
-    sign_path: &PathBuf,
-    logs_data: &mut Vec<String>,
-) -> Result<(), String> {
-    logs_data.push("Info : Processing verification and saving results...".to_string());
-
-    // println!("Error cause {:#?} ",rev_sig);
-
-    let (res_page_data, res_logs) = aqua_verifier
-        .sign_aqua_chain(aqua_page_data, rev_sig)
-        .map_err(|errors| {
-            let error_msg = errors.join("\n");
-            logs_data.push(format!("Verification errors:\n{}", error_msg));
-            error_msg
-        })?;
-
-    res_logs.iter().for_each(|item| {
-        logs_data.push(format!("\t {}", item));
-    });
-
-    save_page_data(&res_page_data, sign_path, "signed.json".to_string()).map_err(|e| {
-        let error = format!("Error saving page data: {}", e);
-        logs_data.push(error.clone());
-        error
-    })?;
-
-    Ok(())
 }
 
 /// Output the results based on CLI arguments
